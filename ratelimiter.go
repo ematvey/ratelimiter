@@ -8,7 +8,7 @@ import (
 )
 
 type RateLimiterBackend interface {
-	GetState(string, time.Time, time.Duration) (LimitState, error)
+	GetState(string, time.Time) (LimitState, error)
 	SetLimit(string, int64)
 	ResetResource(string)
 	Reserve(string, time.Time)
@@ -23,8 +23,8 @@ type LimitState struct {
 }
 
 type RateLimiter struct {
-	backend  RateLimiterBackend
 	Interval time.Duration
+	backend  RateLimiterBackend
 	base     int64
 }
 
@@ -33,7 +33,7 @@ type RateLimiter struct {
 //  password: "" if auth is not required
 func NewRateLimiter(server string, password string) *RateLimiter {
 	interval, _ := time.ParseDuration("1s")
-	backend := NewRedisBackend(server, password)
+	backend := NewRedisBackend(server, password, interval)
 	return &RateLimiter{
 		backend:  backend,
 		Interval: interval,
@@ -47,7 +47,7 @@ func (self *RateLimiter) Check() {
 
 func (self *RateLimiter) Consume(resource string, timeout time.Duration) (ok bool, err error) {
 	now := time.Now()
-	state, err := self.backend.GetState(resource, now, self.Interval)
+	state, err := self.backend.GetState(resource, now)
 	if err != nil {
 		panic(err)
 	}
@@ -77,8 +77,11 @@ func (self *RateLimiter) ResetResource(resource string) {
 	self.backend.ResetResource(resource)
 }
 
+// Backend: redis
 type RedisBackend struct {
-	redisPool *redis.Pool
+	redisPool      *redis.Pool
+	Interval       time.Duration
+	ExpirationTime time.Duration
 }
 
 func (self *RedisBackend) Check() {
@@ -98,26 +101,46 @@ func (self *RedisBackend) ResetResource(resource string) {
 }
 
 func (self *RedisBackend) Reserve(resource string, slot time.Time) {
-	self.redisPool.Get().Do("ZADD", fmt.Sprintf("rl.reqs.%s", resource), slot.UnixNano(), slot.UnixNano())
+	c := self.redisPool.Get()
+	t := slot.UnixNano()
+	expire := slot.Add(self.ExpirationTime).UnixNano()
+	if t > expire {
+		expire = t
+	}
+	expire = time.Unix(0, expire).Unix()
+	key := fmt.Sprintf("rl.reqs.%s", resource)
+	c.Send("ZADD", key, t, t)
+	c.Send("EXPIREAT", key, expire)
+	c.Flush()
+	c.Receive()
+	c.Receive()
 }
 
-func (self *RedisBackend) GetState(resource string, now time.Time, interval time.Duration) (LimitState, error) {
+func (self *RedisBackend) GetState(resource string, now time.Time) (LimitState, error) {
 	c := self.redisPool.Get()
 	key := fmt.Sprintf("rl.reqs.%s", resource)
-	trim_time := now.Add(-interval)
-	rps_limit, err := redis.Int64(c.Do("GET", fmt.Sprintf("rl.rpslim.%s", resource)))
+	trim_time := now.Add(-self.Interval)
+	c.Send("GET", fmt.Sprintf("rl.rpslim.%s", resource))
+	c.Flush()
+	c.Send("ZREMRANGEBYSCORE", key, "-inf", trim_time.UnixNano())
+	c.Send("ZCOUNT", key, "-inf", "+inf")
+	c.Send("ZRANGE", key, -1, -1)
+	c.Flush()
+	rps_limit, err := redis.Int64(c.Receive())
 	if err != nil {
 		return LimitState{}, errors.New("no limit set for given key")
 	}
-	rpi_limit := int64(interval.Seconds() * float64(rps_limit))
-	c.Do("ZREMRANGEBYSCORE", key, "-inf", trim_time.UnixNano())
-	consumed_slots, err := redis.Int64(c.Do("ZCOUNT", key, "-inf", "+inf"))
-	_last := redisInts64(c.Do("ZRANGE", key, -1, -1))
+	rpi_limit := int64(self.Interval.Seconds() * float64(rps_limit))
+	c.Send("ZRANGE", key, -rpi_limit, -rpi_limit)
+	c.Flush()
+	c.Receive()
+	consumed_slots, err := redis.Int64(c.Receive())
+	_last := redisInts64(c.Receive())
 	var last int64 = 0
 	if len(_last) > 0 {
 		last = _last[0]
 	}
-	_first := redisInts64(c.Do("ZRANGE", key, -rpi_limit, -rpi_limit))
+	_first := redisInts64(c.Receive())
 	var first int64 = 0
 	if len(_first) > 0 {
 		first = _first[0]
@@ -130,7 +153,8 @@ func (self *RedisBackend) GetState(resource string, now time.Time, interval time
 	}, nil
 }
 
-func NewRedisBackend(server string, password string) *RedisBackend {
+func NewRedisBackend(server string, password string, interval time.Duration) *RedisBackend {
+	expirationTime, _ := time.ParseDuration("1000s")
 	return &RedisBackend{
 		redisPool: &redis.Pool{
 			MaxIdle:     10000,
@@ -153,6 +177,8 @@ func NewRedisBackend(server string, password string) *RedisBackend {
 				return err
 			},
 		},
+		Interval:       interval,
+		ExpirationTime: expirationTime,
 	}
 }
 
