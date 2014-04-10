@@ -7,15 +7,21 @@ import (
 	"time"
 )
 
+const (
+	key_rps_lim_template = "rl.rpslim.%v"
+	key_reqs_template    = "rl.reqs.%v"
+)
+
 type RateLimiterBackend interface {
-	GetState(string, time.Time) (LimitState, error)
-	SetLimit(string, int64)
-	ResetResource(string)
-	Reserve(string, time.Time)
+	GetState([]string, time.Time) (LimitState, error)
+	SetLimit([]string, int64)
+	ResetResource([]string)
+	Reserve([]string, time.Time)
 	Check()
 }
 
 type LimitState struct {
+	Resource      []string
 	RPILimit      int64
 	ConsumedSlots int64
 	LastReserved  time.Time
@@ -45,14 +51,14 @@ func (self *RateLimiter) Check() {
 	self.backend.Check()
 }
 
-func (self *RateLimiter) Consume(resource string, timeout time.Duration) (ok bool, err error) {
+func (self *RateLimiter) Consume(resource []string, timeout time.Duration) (ok bool, err error) {
 	now := time.Now()
 	state, err := self.backend.GetState(resource, now)
 	if err != nil {
-		panic(err)
+		return false, err
 	}
 	if (state.ConsumedSlots < state.RPILimit) && (state.LastReserved.Before(now)) {
-		self.backend.Reserve(resource, now)
+		self.backend.Reserve(state.Resource, now)
 		return true, nil
 	} else {
 		if state.LastReserved.After(now.Add(timeout)) {
@@ -62,18 +68,18 @@ func (self *RateLimiter) Consume(resource string, timeout time.Duration) (ok boo
 		if availabilityTime.After(now.Add(timeout)) {
 			return false, nil
 		} else {
-			self.backend.Reserve(resource, availabilityTime)
+			self.backend.Reserve(state.Resource, availabilityTime)
 			time.Sleep(availabilityTime.Sub(time.Now()))
 			return true, nil
 		}
 	}
 }
 
-func (self *RateLimiter) SetLimit(resource string, rps int64) {
+func (self *RateLimiter) SetLimit(resource []string, rps int64) {
 	self.backend.SetLimit(resource, rps)
 }
 
-func (self *RateLimiter) ResetResource(resource string) {
+func (self *RateLimiter) ResetResource(resource []string) {
 	self.backend.ResetResource(resource)
 }
 
@@ -92,15 +98,31 @@ func (self *RedisBackend) Check() {
 	}
 }
 
-func (self *RedisBackend) SetLimit(resource string, rps int64) {
-	self.redisPool.Get().Do("SET", fmt.Sprintf("rl.rpslim.%s", resource), rps)
+func (self *RedisBackend) getValidResource(resource []string) (ret []string, err error) {
+	ret, err = nil, errors.New("resource not found")
+	c := self.redisPool.Get()
+	for i := 0; i <= len(resource); i++ {
+		c.Send("GET", fmt.Sprintf(key_rps_lim_template, resource[:len(resource)-i]))
+	}
+	c.Flush()
+	for i := 0; i <= len(resource); i++ {
+		recv, _ := c.Receive()
+		if ret == nil && recv != nil {
+			ret, err = resource[:len(resource)-i], nil
+		}
+	}
+	return
 }
 
-func (self *RedisBackend) ResetResource(resource string) {
-	self.redisPool.Get().Do("ZREMRANGEBYRANK", fmt.Sprintf("rl.reqs.%s", resource), 0, -1)
+func (self *RedisBackend) SetLimit(resource []string, rps int64) {
+	self.redisPool.Get().Do("SET", fmt.Sprintf(key_rps_lim_template, resource), rps)
 }
 
-func (self *RedisBackend) Reserve(resource string, slot time.Time) {
+func (self *RedisBackend) ResetResource(resource []string) {
+	self.redisPool.Get().Do("ZREMRANGEBYRANK", fmt.Sprintf(key_reqs_template, resource), 0, -1)
+}
+
+func (self *RedisBackend) Reserve(resource []string, slot time.Time) {
 	c := self.redisPool.Get()
 	t := slot.UnixNano()
 	expire := slot.Add(self.ExpirationTime).UnixNano()
@@ -108,7 +130,7 @@ func (self *RedisBackend) Reserve(resource string, slot time.Time) {
 		expire = t
 	}
 	expire = time.Unix(0, expire).Unix()
-	key := fmt.Sprintf("rl.reqs.%s", resource)
+	key := fmt.Sprintf(key_reqs_template, resource)
 	c.Send("ZADD", key, t, t)
 	c.Send("EXPIREAT", key, expire)
 	c.Flush()
@@ -116,11 +138,15 @@ func (self *RedisBackend) Reserve(resource string, slot time.Time) {
 	c.Receive()
 }
 
-func (self *RedisBackend) GetState(resource string, now time.Time) (LimitState, error) {
+func (self *RedisBackend) GetState(resource []string, now time.Time) (LimitState, error) {
 	c := self.redisPool.Get()
-	key := fmt.Sprintf("rl.reqs.%s", resource)
+	valid_resource, err := self.getValidResource(resource)
+	if err != nil {
+		return LimitState{}, err
+	}
+	key := fmt.Sprintf(key_reqs_template, valid_resource)
 	trim_time := now.Add(-self.Interval)
-	c.Send("GET", fmt.Sprintf("rl.rpslim.%s", resource))
+	c.Send("GET", fmt.Sprintf(key_rps_lim_template, valid_resource))
 	c.Flush()
 	c.Send("ZREMRANGEBYSCORE", key, "-inf", trim_time.UnixNano())
 	c.Send("ZCOUNT", key, "-inf", "+inf")
@@ -128,6 +154,7 @@ func (self *RedisBackend) GetState(resource string, now time.Time) (LimitState, 
 	c.Flush()
 	rps_limit, err := redis.Int64(c.Receive())
 	if err != nil {
+		fmt.Println(err)
 		return LimitState{}, errors.New("no limit set for given key")
 	}
 	rpi_limit := int64(self.Interval.Seconds() * float64(rps_limit))
@@ -146,6 +173,7 @@ func (self *RedisBackend) GetState(resource string, now time.Time) (LimitState, 
 		first = _first[0]
 	}
 	return LimitState{
+		Resource:      valid_resource,
 		RPILimit:      rpi_limit,
 		ConsumedSlots: consumed_slots,
 		LastReserved:  time.Unix(0, last),

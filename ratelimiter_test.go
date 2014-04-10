@@ -14,8 +14,10 @@ type result struct {
 func TestConstructor(t *testing.T) {
 	rl := NewRateLimiter("0.0.0.0:6379", "")
 	rl.Check()
-	rl.ResetResource("a")
-	rl.SetLimit("a", 3)
+	resource := []string{"a", "b"}
+	rl.ResetResource(resource)
+	rl.ResetResource([]string{"a"})
+	rl.SetLimit([]string{"a"}, 3)
 	timeout, _ := time.ParseDuration("1s")
 	result_chan := make(chan result, 10)
 
@@ -27,7 +29,7 @@ func TestConstructor(t *testing.T) {
 		time.Sleep(sl)
 		go func(i int) {
 			// time.Sleep(sl2)
-			ok, err := rl.Consume("a", timeout)
+			ok, err := rl.Consume(resource, timeout)
 			if err != nil {
 				panic(err)
 			}
