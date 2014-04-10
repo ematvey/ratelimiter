@@ -22,13 +22,11 @@ func TestConstructor(t *testing.T) {
 	result_chan := make(chan result, 10)
 
 	sl, _ := time.ParseDuration("100ms")
-	// sl2, _ := time.ParseDuration("5ms")
 
 	for i := 0; i < 10; i++ {
 		t.Logf("iteration i = %+v", i)
 		time.Sleep(sl)
 		go func(i int) {
-			// time.Sleep(sl2)
 			ok, err := rl.Consume(resource, timeout)
 			if err != nil {
 				panic(err)
